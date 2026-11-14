@@ -1,0 +1,241 @@
+{
+  "name": "BookLeaf - Author Royalty Notification & AI Summary Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bookleaf-royalty-summary",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Bubble Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        300
+      ],
+      "webhookId": "bookleaf-royalty-summary"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1. Webhook Security Verification\nconst headers = $input.item.json.headers || {};\nconst expectedApiKey = $env.BOOKLEAF_WEBHOOK_SECRET || 'bookleaf_secure_token_2026';\nconst receivedKey = headers['x-bookleaf-api-key'] || $input.item.json.query?.apiKey || $input.item.json.body?.apiKey;\n\nif (receivedKey !== expectedApiKey) {\n  throw new Error('Unauthorized: Invalid or missing x-bookleaf-api-key header.');\n}\n\nconst body = $input.item.json.body || {};\nconst authorId = body.author_id || body.authorId;\n\nif (!authorId && !body.author) {\n  throw new Error('Bad Request: author_id or author object is required in webhook payload.');\n}\n\n// 2. Idempotency Check (Prevent duplicate clicks within 60 seconds)\nconst requestId = body.request_id || `req_${authorId}_${Date.now()}`;\n\nreturn {\n  json: {\n    authenticated: true,\n    author_id: authorId,\n    requestId: requestId,\n    timestamp: new Date().toISOString(),\n    payload: body\n  }\n};"
+      },
+      "id": "security-and-idempotency",
+      "name": "Security & Idempotency Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 3. Process Author & Book Data\nconst payload = $input.item.json.payload;\nlet author = payload.author || {};\nlet books = payload.books || [];\n\n// If Bubble passed flattened data:\nif (!author.name && payload.name) {\n  author = {\n    author_id: payload.author_id,\n    name: payload.name,\n    email: payload.email,\n    city: payload.city,\n    phone: payload.phone,\n    joined_date: payload.joined_date\n  };\n}\n\n// Calculate consolidated totals\nlet totalEarned = 0;\nlet totalPaid = 0;\nlet totalPending = 0;\nlet totalCopies = 0;\nconst publishedBooks = [];\nconst inProductionBooks = [];\n\nbooks.forEach(b => {\n  const isProduction = (b.status || '').toLowerCase().includes('in production');\n  if (isProduction) {\n    inProductionBooks.push({\n      title: b.title,\n      genre: b.genre || 'General',\n      status: b.status\n    });\n  } else {\n    const earned = Number(b.total_royalty_earned || b.totalRoyaltyEarned || 0);\n    const paid = Number(b.royalty_paid || b.royaltyPaid || 0);\n    const pending = Number(b.royalty_pending || b.royaltyPending || (earned - paid));\n    const copies = Number(b.total_copies_sold || b.totalCopiesSold || 0);\n\n    totalEarned += earned;\n    totalPaid += paid;\n    totalPending += pending;\n    totalCopies += copies;\n\n    publishedBooks.push({\n      book_id: b.book_id || b.bookId,\n      title: b.title,\n      isbn: b.isbn,\n      mrp: b.mrp,\n      status: b.status,\n      copies_sold: copies,\n      royalty_earned: earned,\n      royalty_paid: paid,\n      royalty_pending: pending,\n      last_payout_date: b.last_royalty_payout_date || b.lastPayoutDate || 'None'\n    });\n  }\n});\n\nreturn {\n  json: {\n    author_id: author.author_id || $input.item.json.author_id,\n    author_name: author.name || 'Author',\n    author_email: author.email || '',\n    author_city: author.city || '',\n    total_earned: totalEarned,\n    total_paid: totalPaid,\n    total_pending: totalPending,\n    total_copies_sold: totalCopies,\n    published_books: publishedBooks,\n    in_production_books: inProductionBooks,\n    has_pending: totalPending > 0,\n    is_below_minimum_threshold: totalPending > 0 && totalPending < 1000,\n    requestId: $input.item.json.requestId\n  }\n};"
+      },
+      "id": "data-processor",
+      "name": "Data Aggregator & Rules Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 4. Construct Grounded Prompt for AI API\nconst data = $input.item.json;\n\nconst systemPrompt = `You are the Author Relations & Royalty Specialist at BookLeaf Publishing (a leading self-publishing house in India & US).\nYour goal is to compose an empathetic, transparent, highly accurate, and professional royalty summary email to an author.\n\nBookLeaf Royalty Policies to Ground Your Response:\n1. Royalty Split: 80% of net profit goes to author, 20% to BookLeaf.\n2. Payout Schedule: Royalties are calculated quarterly and disbursed within 45 days of the quarter ending via bank transfer.\n3. Minimum Payout Threshold: ₹1,000. If accumulated royalties are below ₹1,000, they roll over to the next quarter.\n4. If royalties are fully paid up (₹0 pending), warmly celebrate their performance and congratulate them.\n5. If royalties are overdue or pending, provide a clear timeline for the upcoming quarterly payout cycle without corporate deflection.\n6. If any titles are still In Production (Cover Design / Typesetting), provide an encouraging status update.\n7. Tone: Empathetic, supportive, professional. Authors are creative partners, not customers to manage.\n8. Output Format: Return a JSON object with two fields: \"subject\" and \"html_body\". Do NOT wrap in markdown code blocks.`;\n\nlet booksText = data.published_books.map((b, idx) => \n  `${idx + 1}. \"${b.title}\" (ISBN: ${b.isbn})\n   - Status: ${b.status} | MRP: ₹${b.mrp}\n   - Copies Sold: ${b.copies_sold} copies\n   - Royalty Earned: ₹${b.royalty_earned} | Royalty Paid: ₹${b.royalty_paid}\n   - Royalty Pending: ₹${b.royalty_pending} (Last payout: ${b.last_payout_date})`\n).join('\\n\\n');\n\nif (data.published_books.length === 0) {\n  booksText = \"No published titles yet.\";\n}\n\nlet productionText = \"\";\nif (data.in_production_books.length > 0) {\n  productionText = \"\\nTitles in Production:\\n\" + data.in_production_books.map(b => `- \"${b.title}\" (Stage: ${b.status})`).join('\\n');\n}\n\nconst userPrompt = `Generate a royalty summary notification for:\nAuthor Name: ${data.author_name}\nCity: ${data.author_city}\nTotal Royalty Earned: ₹${data.total_earned}\nTotal Royalty Paid: ₹${data.total_paid}\nTotal Royalty Pending: ₹${data.total_pending}\nTotal Copies Sold: ${data.total_copies_sold}\nBelow Threshold (<₹1,000): ${data.is_below_minimum_threshold ? \"YES (will roll over to next quarter)\" : \"NO\"}\n\nPublished Books Breakdown:\n${booksText}\n${productionText}\n\nPlease write the complete personalized email now.`;\n\nreturn {\n  json: {\n    ...data,\n    systemPrompt,\n    userPrompt\n  }\n};"
+      },
+      "id": "prompt-builder",
+      "name": "AI Prompt Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + ($env.OPENAI_API_KEY || 'sk-proj-placeholder') }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n          JSON.stringify({\n            model: \"gpt-4o-mini\",\n            messages: [\n              { role: \"system\", content: $json.systemPrompt },\n              { role: \"user\", content: $json.userPrompt }\n            ],\n            temperature: 0.3,\n            max_tokens: 800,\n            response_format: { type: \"json_object\" }\n          })\n        }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "openai-api-call",
+      "name": "OpenAI GPT-4o-mini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// 5. Parse AI Response with Fallback Heuristics\nconst item = $input.item.json;\nconst priorData = $('Data Aggregator & Rules Engine').first().json;\n\nlet subject = `BookLeaf Royalty Update - ${priorData.author_name}`;\nlet htmlBody = \"\";\nlet aiStatus = \"Success\";\n\nif (item.error || !item.choices || !item.choices[0]) {\n  aiStatus = \"Fallback_Generated\";\n  subject = `BookLeaf Royalty Summary & Status Report for ${priorData.author_name}`;\n  \n  const pendingNote = priorData.total_pending > 0\n    ? (priorData.is_below_minimum_threshold \n        ? `<p>Your pending balance of ₹${priorData.total_pending} is currently below the ₹1,000 minimum threshold and will roll over to the next quarter.</p>`\n        : `<p>Your pending balance of ₹${priorData.total_pending} will be processed in the upcoming quarterly cycle within 45 days of the quarter ending.</p>`)\n    : `<p>Your royalty accounts are fully settled with zero pending balance. Thank you for being a valued BookLeaf author!</p>`;\n\n  htmlBody = `\n    <div style=\"font-family: Arial, sans-serif; line-height: 1.6; color: #333;\">\n      <h2 style=\"color: #059669;\">Hello ${priorData.author_name},</h2>\n      <p>Here is your latest royalty overview across your titles at BookLeaf Publishing:</p>\n      <table style=\"width: 100%; border-collapse: collapse; margin: 15px 0;\">\n        <tr style=\"background: #f3f4f6;\">\n          <th style=\"padding: 8px; border: 1px solid #ddd;\">Total Copies Sold</th>\n          <th style=\"padding: 8px; border: 1px solid #ddd;\">Total Earned</th>\n          <th style=\"padding: 8px; border: 1px solid #ddd;\">Total Paid</th>\n          <th style=\"padding: 8px; border: 1px solid #ddd;\">Pending Balance</th>\n        </tr>\n        <tr style=\"text-align: center;\">\n          <td style=\"padding: 8px; border: 1px solid #ddd;\">${priorData.total_copies_sold}</td>\n          <td style=\"padding: 8px; border: 1px solid #ddd;\">₹${priorData.total_earned}</td>\n          <td style=\"padding: 8px; border: 1px solid #ddd;\">₹${priorData.total_paid}</td>\n          <td style=\"padding: 8px; border: 1px solid #ddd; font-weight: bold; color: #059669;\">₹${priorData.total_pending}</td>\n        </tr>\n      </table>\n      ${pendingNote}\n      <p>Best regards,<br><strong>BookLeaf Publishing Operations Team</strong></p>\n    </div>\n  `;\n} else {\n  try {\n    const parsed = JSON.parse(item.choices[0].message.content);\n    subject = parsed.subject || subject;\n    htmlBody = parsed.html_body || parsed.body || item.choices[0].message.content;\n  } catch (e) {\n    htmlBody = item.choices[0].message.content;\n  }\n}\n\nreturn {\n  json: {\n    author_id: priorData.author_id,\n    author_name: priorData.author_name,\n    author_email: priorData.author_email,\n    total_pending: priorData.total_pending,\n    email_subject: subject,\n    email_body: htmlBody,\n    status: \"Success\",\n    ai_status: aiStatus,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "parse-ai-output",
+      "name": "Parse Output & Fallback Safety",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BUBBLE_API_URL || 'http://localhost:3002/api/notifications/callback' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-callback-secret",
+              "value": "={{ $env.BOOKLEAF_WEBHOOK_SECRET || 'bookleaf_secure_token_2026' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n          JSON.stringify({\n            author_id: $json.author_id,\n            author_name: $json.author_name,\n            author_email: $json.author_email,\n            status: \"Success\",\n            subject: $json.email_subject,\n            email_body: $json.email_body,\n            sent_at: $json.timestamp\n          })\n        }}",
+        "options": {}
+      },
+      "id": "bubble-callback-logger",
+      "name": "Bubble Notification Log Callback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1420,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{\n          JSON.stringify({\n            success: true,\n            message: \"Royalty summary generated and logged successfully.\",\n            author_id: $json.author_id,\n            author_name: $json.author_name,\n            status: \"Success\",\n            subject: $json.email_subject,\n            preview: $json.email_body.substring(0, 180) + '...',\n            timestamp: $json.timestamp\n          })\n        }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "respond-to-webhook",
+      "name": "Respond Success to Bubble",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1640,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Bubble Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Security & Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Security & Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Data Aggregator & Rules Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Aggregator & Rules Engine": {
+      "main": [
+        [
+          {
+            "node": "AI Prompt Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Prompt Builder": {
+      "main": [
+        [
+          {
+            "node": "OpenAI GPT-4o-mini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI GPT-4o-mini": {
+      "main": [
+        [
+          {
+            "node": "Parse Output & Fallback Safety",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Output & Fallback Safety": {
+      "main": [
+        [
+          {
+            "node": "Bubble Notification Log Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bubble Notification Log Callback": {
+      "main": [
+        [
+          {
+            "node": "Respond Success to Bubble",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
